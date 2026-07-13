@@ -23,6 +23,10 @@ USB Mode: Hardware CDC and JTAG
 
 If speed, acceleration, deceleration, motor current, chopper off-time, or microstep is changed, you must test the CalibrateStall() code with a known combination!
 StallGuard is very finicky and has to be tuned for many variables. The current calibration process will not work if some of these variables change.
+
+Changes
+1. Fixed reconnect crash (upstream, Jared Dygert)
+2. Ported to WT32-SC01 Plus: onboard 480x320 touchscreen UI, I2S audio (click + open chime), on-screen driver diagnostics
 */
 
 #include <Arduino.h>
@@ -41,9 +45,10 @@ StallGuard is very finicky and has to be tuned for many variables. The current c
 
 // WT32-SC01 Plus pin assignments.
 // GPIOs 0,3,4,5,6,7,8,9,15-18,45-47 are reserved by the display and touch
-// controller. Motor driver is wired to the SD-card header (10-13), the
-// exposed GPIO header (14, 21), and the debug-port TXD0 (43) for DIAG0.
-// Serial output uses USB CDC (not UART0), so GPIO 43 is free.
+// controller; 35-37 by the onboard audio amp. The motor driver is wired to
+// the Extended IO header (GPIO 10,11,12,13,14,21 — datasheet Tab.2) and the
+// debug-port ESP_TXD pin (GPIO 43) for DIAG0. Serial uses USB CDC (not UART0),
+// so GPIO 43 is free.
 #define STEP_PIN   10
 #define DIR_PIN    21
 #define MISO_PIN   12
@@ -51,6 +56,9 @@ StallGuard is very finicky and has to be tuned for many variables. The current c
 #define SCK_PIN    13
 #define CS_PIN     14
 #define DIAG0_PIN  43             // debug port pin 3 (TXD0), free with USB CDC enabled
+// DIAG1 is intentionally left unconnected. It is a driver *output* (position
+// compare / second stall flag) that this project does not use, so no ESP32 GPIO
+// is assigned to it and its pin is left floating. Do NOT tie it to a rail.
 #define R_SENSE    0.075f         // TMC5160T Pro
 
 // TMC5160 Register addresses, not used but here in case anyone wants them
@@ -81,6 +89,8 @@ bool powerLossResume = false;            // If needing to resume after power los
 volatile bool emergencyStop = false;     // If needing to suddenly stop (such as lock is open)
 volatile bool stallGuardArmed = false;   // Whether StallGuard is active
 volatile bool testingOpen = false;       // Whether we're trying to open the lock
+volatile bool lockOpenDetected = false;  // Set by OnStall when stall fires during open test
+volatile uint8_t webAnnounce = WEB_ANN_NONE;  // Touch action to mirror to web SSE (drained on core 1)
 
 // Motor variables (speeds are in microseconds)
 int maxDelay = 700;                      // Slowest speed (in microseconds)   Default = 300
@@ -119,21 +129,36 @@ String startBody = "";
 TMC5160Stepper driver(CS_PIN, R_SENSE, MOSI_PIN, MISO_PIN, SCK_PIN);  // Create driver
 SafeLock* lock = new SafeLock;                                        // Create lock object
 
-// Called when stepper stalls
-void OnStall() {
-  SendStatusSimple("EMERGENCY STOP");
-  SendLog("EMERGENCY STOP");
+// StallGuard interrupt (DIAG0). Kept ISR-safe: it only sets volatile flags — no
+// events.send(), String, or LGFX access, all of which are unsafe in an ISR. The
+// "EMERGENCY STOP" web/log message and the open chime are emitted from core 1 in
+// TestOpen() when lockOpenDetected is observed after an open test.
+void IRAM_ATTR OnStall() {
+  if (testingOpen) lockOpenDetected = true;
   emergencyStop = true;
+}
+
+// Drains any pending touch action into the web SSE. Must run on the Arduino task
+// (core 1) — the touch task on core 0 only sets webAnnounce, since events.send()
+// is not safe to call from outside the AsyncTCP/Arduino context.
+void PumpWebAnnounce() {
+  uint8_t a = webAnnounce;
+  if (a == WEB_ANN_NONE) return;
+  webAnnounce = WEB_ANN_NONE;
+  if (a == WEB_ANN_ESTOP)       SendStatusSimple("EMERGENCY STOP");
+  else if (a == WEB_ANN_PAUSED) SendStatusSimple("PAUSED");
 }
 
 // Setup
 void setup() {
+  Serial.begin(115200);
   DisplayInit();
+  AudioInit();
   LittleFS.begin();
   WifiSetup(ssidap, passwordap);
 
   events.onConnect([](AsyncEventSourceClient* client) {
-    client->send("", NULL, millis(), 10000);
+    client->send("", NULL, 0, 10000);  // id 0, not millis(), so a reconnecting client doesn't replay a stale id (upstream reconnect-crash fix)
   });
   server.addHandler(&events);
 
@@ -322,6 +347,11 @@ void setup() {
   server.onNotFound(NotFound);
   server.begin();
 
+  // Start touch input on its own core-0 task so buttons stay responsive during a
+  // run (loop() blocks inside AutoDial for the whole session). Passes the same
+  // flags the web handlers use.
+  DisplayStartInput(&emergencyStop, &pauseDialing, &webAnnounce);
+
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, CS_PIN);
   pinMode(CS_PIN, OUTPUT);
   digitalWrite(CS_PIN, HIGH);
@@ -331,6 +361,89 @@ void setup() {
   driver.rms_current(2200);   // Motor current. Running a bit low to reduce heat. Affects StallGuard so change with caution.
   driver.microsteps(8);       // 16 microstep (1,600 steps per revolution).
   driver.en_pwm_mode(false);  // SpreadCycle. Required for StallGuard on TMC5160.
+
+  // TMC5160 SPI self-test. If SPI comms fail (bad VIO, or MISO/MOSI/SCK/CS
+  // wiring), every config write above is silently dropped and the driver stays
+  // in its power-on state with the output stage OFF — so the motor never moves
+  // and never heats up even though the driver's power LED is lit.
+  //   version() should read 0x30 on a TMC5160 (0x00 or 0xFF => no SPI reply).
+  //   test_connection() returns 0 = OK; nonzero = fail (reads came back all-zero
+  //   or all-one) => check VIO is really at 3.3V and the MISO/MOSI/SCK/CS wiring.
+  {
+    uint8_t ver  = driver.version();
+    uint8_t conn = driver.test_connection();
+    bool spiOk = (conn == 0 && ver == 0x30);
+
+    // SPI is proven, so config writes landed. If the motor still won't move / heat,
+    // the fault is on the power side, which these registers expose:
+    //   uv_cp   = charge-pump undervoltage (gate-drive supply derived from VMOT;
+    //             a proxy for VMOT health, NOT a VMOT voltage measurement).
+    //   drv_err = latched driver error.
+    //   ola/olb = open load on coil A / B    => that coil isn't connected
+    //             (loose motor lead or wrong A1/A2-B1/B2 pairing).
+    //   s2ga/s2gb = short to ground on a coil.
+    //   ot/otpw = over-temperature.
+    //   cs_actual = commanded current scale (0 => driver isn't asking for current).
+    // GSTAT bits (reset, uv_cp) latch the power-on transient before VMOT/charge
+    // pump stabilize, so clear them and let things settle before sampling —
+    // otherwise uv_cp reads set at boot even when the rail is fine.
+    driver.GSTAT(0b111);   // clear latched power-up flags
+    delay(20);             // let the charge pump stabilize
+    bool     uv   = driver.uv_cp();
+    bool     err  = driver.drv_err();
+    bool     ola  = driver.ola();
+    bool     olb  = driver.olb();
+    bool     s2ga = driver.s2ga();
+    bool     s2gb = driver.s2gb();
+    bool     ot   = driver.ot();
+    bool     otpw = driver.otpw();
+    uint16_t cs   = driver.cs_actual();
+
+    // STEP/DIR path check. cs_actual pinned at max (31) with everything else OK is
+    // the signature of the chip sitting in SPI motion-controller mode and ignoring
+    // STEP/DIR: the internal ramp generator holds full current at standstill.
+    //   sd_mode() reports the active interface (1 = STEP/DIR, 0 = SPI). It mirrors
+    //   the hardware SD_MODE pin and CANNOT be changed in software — if it reads
+    //   SPI, tie the driver's SD_MODE pin high (to VIO/3.3V).
+    // We also drive STEP/DIR and read them back through IOIN to prove the wiring
+    // reaches the driver, independent of which mode it's in.
+    // DRV_ENN mirrors the hardware enable pin. It has an internal pull-up, so a
+    // loose/missing EN->GND wire floats it HIGH = output stage disabled: SPI, the
+    // charge pump (uv_cp), and cs_actual all still look healthy, but no current
+    // reaches the coils (no torque, no heat). 1 = disabled, 0 = enabled.
+    bool enn = driver.drv_enn();   // public IOIN accessor (drv_enn_cfg6 is protected)
+
+    bool sd = driver.sd_mode();
+    pinMode(DIR_PIN, OUTPUT);
+    pinMode(STEP_PIN, OUTPUT);
+    digitalWrite(DIR_PIN,  HIGH); delayMicroseconds(50); bool dHi = driver.refr_dir();
+    digitalWrite(DIR_PIN,  LOW);  delayMicroseconds(50); bool dLo = driver.refr_dir();
+    digitalWrite(STEP_PIN, HIGH); delayMicroseconds(50); bool sHi = driver.refl_step();
+    digitalWrite(STEP_PIN, LOW);  delayMicroseconds(50); bool sLo = driver.refl_step();
+    bool dirOk  = dHi && !dLo;
+    bool stepOk = sHi && !sLo;
+
+    Serial.printf("TMC5160 SPI: version=0x%02X test_connection=%u\n", ver, conn);
+    Serial.printf("GSTAT: reset=%u drv_err=%u uv_cp=%u\n", driver.reset(), err, uv);
+    Serial.printf("DRV_STATUS: ola=%u olb=%u s2ga=%u s2gb=%u ot=%u otpw=%u cs_actual=%u stst=%u\n",
+                  ola, olb, s2ga, s2gb, ot, otpw, cs, driver.stst());
+    Serial.printf("IOIN: drv_enn=%u sd_mode=%u step_wire_ok=%u dir_wire_ok=%u\n", enn, sd, stepOk, dirOk);
+
+    // On-screen diagnostic panel — no serial cable needed at the bench. Stays up
+    // until the first run redraws the combo/progress area.
+    DisplayDiagBegin("DRIVER DIAGNOSTICS");
+    DisplayDiagLine("SPI",          spiOk ? "OK 0x30" : ("FAIL v0x" + String(ver, HEX)), !spiOk);
+    DisplayDiagLine("chg-pump uv",  uv ? "UNDERVOLT" : "ok", uv);
+    DisplayDiagLine("enable (ENN)", enn ? "OFF-disabled" : "ON", enn);
+    DisplayDiagLine("drv_err",      err ? "ERROR" : "ok", err);
+    DisplayDiagLine("open load",    (ola || olb) ? (String(ola ? "A " : "") + (olb ? "B" : "")) : "ok", ola || olb);
+    DisplayDiagLine("short GND",    (s2ga || s2gb) ? (String(s2ga ? "A " : "") + (s2gb ? "B" : "")) : "ok", s2ga || s2gb);
+    DisplayDiagLine("over-temp",    (ot || otpw) ? (ot ? "OVERTEMP" : "warn") : "ok", ot || otpw);
+    DisplayDiagLine("cs_actual",    String(cs), cs == 0);
+    DisplayDiagLine("mode",         sd ? "STEP/DIR" : "SPI-no STEP", !sd);
+    DisplayDiagLine("STEP wire",    stepOk ? "ok" : "FAIL", !stepOk);
+    DisplayDiagLine("DIR wire",     dirOk ? "ok" : "FAIL", !dirOk);
+  }
 
   // StallGuard config
   driver.TCOOLTHRS(0xFFFFF);  // Enable StallGuard at all speeds (tune this down later)
@@ -354,7 +467,10 @@ void setup() {
 
 // Checks for what task to do next
 void loop() {
-  DisplayCheckTouch(&emergencyStop, &pauseDialing);
+  // Touch is handled on a dedicated core-0 task (see DisplayStartInput), so no
+  // polling is needed here — loop() can block inside AutoDial for a whole run.
+  // Mirror any touch stop/pause to the web SSE from this (core 1) context.
+  PumpWebAnnounce();
 
   if (powerLossResume && !busy) {
     busy = true;
@@ -648,7 +764,8 @@ bool LoadProgress(float* curCombo, int* numsTried, int& current, int& count) {
 
 // Send message to webserver
 void SendLog(String message) {
-  events.send(message.c_str(), "log", millis());
+  if (events.count() > 0)   // don't send with no clients connected (upstream reconnect-crash fix)
+    events.send(message.c_str(), "log", millis());
 }
 
 // Sends wheels config to web server
@@ -673,35 +790,43 @@ void LogWheels() {
 
 // Send status update to web server and local display
 void SendStatus(String status, float* wheelNums, int wheelCount, int current, int total, String phase = "brute") {
-  String json = "{\"status\":\"" + status + "\",\"wheels\":[";
-  for (int i = 0; i < wheelCount; i++) {
-    json += String(wheelNums[i], 1);
-    if (i < wheelCount - 1) json += ",";
-  }
-  json += "],\"current\":" + String(current) + ",\"total\":" + String(total) + ",\"phase\":\"" + phase + "\"";
-  json += ",\"everyX\":" + String(lock->everyX, 4);
-  json += ",\"rcp\":" + String(lock->RCP, 4);
-  json += ",\"lcp\":" + String(lock->LCP, 4);
-  json += ",\"checkDropIn\":" + String(checkDropIn ? "true" : "false");
-  json += ",\"wheelMeta\":[";
-  for (int i = 0; i < lock->wheelCount; i++) {
-    json += "{\"excl\":[";
-    for (int y = 0; y < lock->wheels[i].exclusionCount; y++) {
-      json += String(lock->wheels[i].exclusions[y]);
-      if (y < lock->wheels[i].exclusionCount - 1) json += ",";
+  // Web send is guarded on client count (upstream reconnect-crash fix), but the
+  // local display must update regardless of whether a browser is connected.
+  if (events.count() > 0) {
+    String json = "{\"status\":\"" + status + "\",\"wheels\":[";
+    for (int i = 0; i < wheelCount; i++) {
+      json += String(wheelNums[i], 1);
+      if (i < wheelCount - 1) json += ",";
+    }
+    json += "],\"current\":" + String(current) + ",\"total\":" + String(total) + ",\"phase\":\"" + phase + "\"";
+    json += ",\"everyX\":" + String(lock->everyX, 4);
+    json += ",\"rcp\":" + String(lock->RCP, 4);
+    json += ",\"lcp\":" + String(lock->LCP, 4);
+    json += ",\"checkDropIn\":" + String(checkDropIn ? "true" : "false");
+    json += ",\"wheelMeta\":[";
+    for (int i = 0; i < lock->wheelCount; i++) {
+      json += "{\"excl\":[";
+      for (int y = 0; y < lock->wheels[i].exclusionCount; y++) {
+        json += String(lock->wheels[i].exclusions[y]);
+        if (y < lock->wheels[i].exclusionCount - 1) json += ",";
+      }
+      json += "]}";
+      if (i < lock->wheelCount - 1) json += ",";
     }
     json += "]}";
-    if (i < lock->wheelCount - 1) json += ",";
+    events.send(json.c_str(), "status", millis());
   }
-  json += "]}";
-  events.send(json.c_str(), "status", millis());
   DisplayUpdateStatus(status, wheelNums, wheelCount, current, total);
 }
 
 // Send status with no wheel numbers (waiting / emergency stop) to web server and local display
 void SendStatusSimple(String status) {
-  String json = "{\"status\":\"" + status + "\",\"wheels\":[],\"current\":0,\"total\":0}";
-  events.send(json.c_str(), "status", millis());
+  // Web send guarded on client count (upstream reconnect-crash fix); local
+  // display updates regardless.
+  if (events.count() > 0) {
+    String json = "{\"status\":\"" + status + "\",\"wheels\":[],\"current\":0,\"total\":0}";
+    events.send(json.c_str(), "status", millis());
+  }
   DisplayUpdateSimple(status);
 }
 
@@ -1200,12 +1325,19 @@ void TestOpen() {
         break;
       }
     }
+    lockOpenDetected = false;   // ignore any stall latched earlier (e.g. calibration)
     testingOpen = true;
     GoTo("R", targetPos);
     testingOpen = false;
+    if (lockOpenDetected) {
+      lockOpenDetected = false;
+      SendStatusSimple("EMERGENCY STOP");
+      SendLog("EMERGENCY STOP");
+      AudioChime();
+    }
   }
   else if (lock->openRot == "L") {
-    float targetPos = NormalizeNum(lock->RCP + lock->openPast);\
+    float targetPos = NormalizeNum(lock->RCP + lock->openPast);
     float tempPos = lock->position;
 
     // Update wheels if any are picked up from trying to open the lock
@@ -1220,9 +1352,16 @@ void TestOpen() {
       }
     }
 
+    lockOpenDetected = false;   // ignore any stall latched earlier (e.g. calibration)
     testingOpen = true;
     GoTo("L", targetPos);
     testingOpen = false;
+    if (lockOpenDetected) {
+      lockOpenDetected = false;
+      SendStatusSimple("EMERGENCY STOP");
+      SendLog("EMERGENCY STOP");
+      AudioChime();
+    }
   }
 }
 
@@ -1440,8 +1579,11 @@ void AutoDial() {
 
       if (pauseDialing) {
         driver.rms_current(1000);
+        PumpWebAnnounce();   // mirror touch-initiated PAUSED to web (loop() is blocked here)
 
-        while (pauseDialing) {
+        // Also break the pause wait on an emergency stop (e.g. touch E-STOP while paused)
+        while (pauseDialing && !emergencyStop) {
+          PumpWebAnnounce();
           delay(100);
         }
 
