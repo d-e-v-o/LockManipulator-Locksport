@@ -34,6 +34,7 @@ Specific to this touchscreen case (in addition to the mechanical parts below):
 - **8-pin PicoBlade cable** (Adafruit 4928) — https://www.adafruit.com/product/4928
 - **5 V → 3.3 V regulator** — https://amzn.to/4vGqHvz
 - **Heatsinks for the stepper driver** (4×) — https://amzn.to/4hrIzGO
+- **Terminal blocks** — https://amzn.to/4xchqg3
 - **Screws** (https://amzn.to/4f9Nn2e):
   - 4× **M3×16** — attach the bezel + screen to the case
   - 4× **M3×6** — back panel to the case
