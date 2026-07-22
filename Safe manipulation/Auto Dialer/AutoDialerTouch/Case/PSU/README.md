@@ -41,11 +41,22 @@ Generated parametrically with [build123d](https://github.com/gumyr/build123d) �
   bridge). The lid ledge is undercut with a ~58° self-supporting ramp and the corner posts are
   full-height, so neither needs support.
 - **Lid:** flat, either side down.
+- **Support threshold:** printed successfully on a Bambu X1 with the support threshold set to
+  **10°** — that generates supports *only* at the inlet cutout and leaves everything else alone.
+- **Bed fit (X1 / 256 × 256):** the body footprint is **241 × 131.5 mm**, leaving only ~7.5 mm per
+  side in X. It fits, but **auto-arrange will refuse to place it** because of the edge margin it
+  reserves. Place it manually — shifting it to one side of the bed leaves room for the inlet-cutout
+  support to sit on the plate. The lid (235.4 × 125.9) is nearly as wide; **print the two parts
+  separately**, they will not plate together.
 
 ## To confirm before final assembly
 - The PSU barrier-strip **terminal stud size is not published.** Measure the ring-terminal inner
   diameter on the inlet's pre-wired leads (they fit the PSU): ~3.7 → #6/M3.5, ~4.3 → #8/M4,
   ~5.3 → #10/M5. Order fork/spade terminals in that stud size, rated for your gauge
   (14 AWG = blue, 22 AWG = red). Note the inlet's own leads are 18 AWG.
-- Test-fit the spade bodies + wire bend in the +X bay after printing.
+- Clearance in the +X bay is **tight even at 38 mm**. The fix is **right-angle "flag" spade
+  terminals**, which turn the wire 90° so it runs along the terminal block instead of straight out
+  of it — that is what the bay depth assumes. Plan on **re-terminating the leads yourself**; the
+  alternatives (moving the inlet to a side wall, or making the case taller) both waste far more
+  volume for the same result. Test-fit before wiring it all up.
 - Re-slice the STLs (any previously bundled `.3mf` is stale).
