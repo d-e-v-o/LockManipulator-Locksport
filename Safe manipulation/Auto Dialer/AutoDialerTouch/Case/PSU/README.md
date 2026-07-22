@@ -8,6 +8,8 @@ with a removable honeycomb-vented lid. The low-voltage harness exits upward to t
 Generated parametrically with [build123d](https://github.com/gumyr/build123d) — see
 `PSU-Case-generator.py` (deps: `build123d`, `numpy`; writes STL/STEP to the `OUT` path).
 
+![Body and lid, exploded](_PSU_EXPLODED.png)
+
 ## Print these
 - `PSU-Case-Body.stl` / `.step`
 - `PSU-Case-Lid.stl` / `.step`
@@ -30,6 +32,9 @@ Generated parametrically with [build123d](https://github.com/gumyr/build123d) �
 - Inlet: 15 A fused + switched IEC C14 inlet module (screw-mount, ~47 × 28 cutout)
 - Screws: 4× M3 (lid), 2× M3 (PSU hold-down), 2× M3 (inlet)
 - Spade/fork terminals for the PSU barrier strip — **stud size TBD, see below**
+
+![Interior — vents, standoffs, corner posts](_PSU_BODY.png)
+![Inlet end](_PSU_INLET.png)
 
 ## Print notes
 - **Body:** open-top up. No supports needed except the **top of the inlet cutout** (one small
