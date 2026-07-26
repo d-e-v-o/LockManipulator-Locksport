@@ -31,7 +31,9 @@ Generated parametrically with [build123d](https://github.com/gumyr/build123d) �
 - PSU: Arcity 5V/12V/24V arcade PSU (160 × 98.5 × 39)
 - Inlet: 15 A fused + switched IEC C14 inlet module (screw-mount, ~47 × 28 cutout)
 - Screws: 4× M3 (lid), 2× M3 (PSU hold-down), 2× M3 (inlet)
-- Spade/fork terminals for the PSU barrier strip — **stud size TBD, see below**
+- **PSU barrier strip:** #8-stud fork/spade terminals (gauge to suit your wire, e.g. 14 AWG = blue)
+- **IEC inlet tabs:** 5 mm wide (NOT the usual 6.35 mm / .25"). Use **.187" (4.8 mm) flag disconnects
+  — `FLDNY2-187`, blue / 16–14 AWG. Right-angle "flag" style is what the +X bay depth assumes.
 
 ![Interior — vents, standoffs, corner posts](_PSU_BODY.png)
 ![Inlet end](_PSU_INLET.png)
@@ -49,14 +51,16 @@ Generated parametrically with [build123d](https://github.com/gumyr/build123d) �
   support to sit on the plate. The lid (235.4 × 125.9) is nearly as wide; **print the two parts
   separately**, they will not plate together.
 
+## Wiring terminals (measured)
+- **PSU barrier strip:** #8 screw studs → #8 fork/spade terminals.
+- **IEC inlet:** 5 mm tabs → `FLDNY2-187` .187" flag disconnects (blue, 16–14 AWG). The usual
+  .25" flags are too wide. The inlet's own pre-wired leads are 18 AWG; plan on **re-terminating
+  them yourself** with the flags above.
+- **Why flags:** clearance in the +X bay is tight even at 38 mm. Right-angle flag terminals turn
+  the wire 90° so it runs along the terminal block instead of straight out — that is what the bay
+  depth assumes. The alternatives (inlet on a side wall, or a taller case) waste far more volume
+  for the same result.
+
 ## To confirm before final assembly
-- The PSU barrier-strip **terminal stud size is not published.** Measure the ring-terminal inner
-  diameter on the inlet's pre-wired leads (they fit the PSU): ~3.7 → #6/M3.5, ~4.3 → #8/M4,
-  ~5.3 → #10/M5. Order fork/spade terminals in that stud size, rated for your gauge
-  (14 AWG = blue, 22 AWG = red). Note the inlet's own leads are 18 AWG.
-- Clearance in the +X bay is **tight even at 38 mm**. The fix is **right-angle "flag" spade
-  terminals**, which turn the wire 90° so it runs along the terminal block instead of straight out
-  of it — that is what the bay depth assumes. Plan on **re-terminating the leads yourself**; the
-  alternatives (moving the inlet to a side wall, or making the case taller) both waste far more
-  volume for the same result. Test-fit before wiring it all up.
+- Test-fit the flag terminals + wire bend in the +X bay before final wiring.
 - Re-slice the STLs (any previously bundled `.3mf` is stale).
