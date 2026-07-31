@@ -50,7 +50,8 @@ A slip-in TPU grommet strain-relieves the 3× 14 AWG harness where it exits the 
   inner flange is shorter (clears the lid ledge on the cavity side) with a smaller 2 mm overhang so
   it inserts more easily; the outer runs full height with 3 mm overhang for grip.
 - **Print in TPU at ≤20% infill** so it stays flexible enough to insert and to grip the wires.
-  Tune the Ø4 mm holes (`WD` in the generator) to your actual wire OD if needed.
+- Ø4 mm holes are **confirmed against real 14 AWG** (grip verified). Change `WD` in the generator
+  only if your wire differs.
 
 ## Print notes
 - **Body:** open-top up. No supports needed except the **top of the inlet cutout** (one small
@@ -65,16 +66,17 @@ A slip-in TPU grommet strain-relieves the 3× 14 AWG harness where it exits the 
   support to sit on the plate. The lid (235.4 × 125.9) is nearly as wide; **print the two parts
   separately**, they will not plate together.
 
-## Wiring terminals (measured)
-- **PSU barrier strip:** #8 screw studs → #8 fork/spade terminals.
+## Wiring terminals (measured, verified)
+- **PSU barrier strip:** #8 screw studs → #8 fork/spade terminals. *(confirmed in hand)*
 - **IEC inlet:** 5 mm tabs → `FLDNY2-187` .187" flag disconnects (blue, 16–14 AWG). The usual
-  .25" flags are too wide. The inlet's own pre-wired leads are 18 AWG; plan on **re-terminating
-  them yourself** with the flags above.
+  .25" flags are too wide. *(confirmed in hand.)* The inlet's own pre-wired leads are 18 AWG; plan
+  on **re-terminating them yourself** with the flags above.
 - **Why flags:** clearance in the +X bay is tight even at 38 mm. Right-angle flag terminals turn
   the wire 90° so it runs along the terminal block instead of straight out — that is what the bay
   depth assumes. The alternatives (inlet on a side wall, or a taller case) waste far more volume
   for the same result.
 
 ## To confirm before final assembly
-- Test-fit the flag terminals + wire bend in the +X bay before final wiring.
+- Final-fit check: with the flags crimped and seated, confirm the connector bodies + wire bend
+  clear inside the 38 mm (+X) bay at assembly.
 - Re-slice the STLs (any previously bundled `.3mf` is stale).
