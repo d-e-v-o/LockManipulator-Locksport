@@ -23,6 +23,9 @@ USB Mode: Hardware CDC and JTAG
 
 If speed, acceleration, deceleration, motor current, chopper off-time, or microstep is changed, you must test the CalibrateStall() code with a known combination!
 StallGuard is very finicky and has to be tuned for many variables. The current calibration process will not work if some of these variables change.
+
+Changes
+1. Fixed reconnect crash
 */
 
 #include <Arduino.h>
@@ -37,14 +40,14 @@ StallGuard is very finicky and has to be tuned for many variables. The current c
 #include "esp_task_wdt.h"
 
 #define stepsPerRevolution 1600   // How many steps the motor moves for 1 full rotation
-#define STEP_PIN 10               // Step pin
-#define DIR_PIN 9                 // Direction pin
-#define MISO_PIN 6                // MISO pin
-#define MOSI_PIN 3                // MOSI pin
-#define SCK_PIN 4                 // SCK pin
-#define CS_PIN 5                  // Chip select pin
-#define DIAG0_PIN 8               // Interrupt pin
-#define DIAG1_PIN 7               // Position compare pin
+#define STEP_PIN 10               // Step pin, default 10
+#define DIR_PIN 9                 // Direction pin, default 9
+#define MISO_PIN 6                // MISO pin, default 6
+#define MOSI_PIN 3                // MOSI pin, default 3
+#define SCK_PIN 4                 // SCK pin, default 4
+#define CS_PIN 5                  // Chip select pin, default 5
+#define DIAG0_PIN 8               // Interrupt pin, default 8
+#define DIAG1_PIN 7               // Position compare pin, default 7
 #define R_SENSE 0.075f            // TMC5160T Pro is 0.075
 
 // TMC5160 Register addresses, not used but here in case anyone wants them
@@ -70,6 +73,8 @@ bool motorRunning = false;               // If motor is running
 bool center = false;                     // If need to center dial
 bool spin = false;                       // If need to spin dial
 bool busy = false;                       // If currently doing something
+bool pauseDialing = false;               // Whether to pause
+bool powerLossResume = false;            // If needing to resume after power loss
 volatile bool emergencyStop = false;     // If needing to suddenly stop (such as lock is open)
 volatile bool stallGuardArmed = false;   // Whether StallGuard is active
 volatile bool testingOpen = false;       // Whether we're trying to open the lock
@@ -88,6 +93,11 @@ int stallVal = -4;                       // -64 to +63, automatically calibrated
 float dropInPoint = 0;                   // Middle of the drop in area
 bool checkDropIn = false;                // Whether to check the last wheel in the drop in area
 float wheelOneStartPosition = 0;         // Start auto dialing with wheel one at this position
+float* possibleNums = nullptr;           // Possible numbers in the combination
+int possibleNumsCount = 0;               // How many possible numbers there are
+bool checkBoth = false;                  // Whether to try opening in both directions
+float** triedCombos = nullptr;           // If possible known numbers given, save each one tried to avoid duplicates
+int triedComboCount = 0;                 // How many possible known numbers tried
 
 //AP handling
 const char* ssidap = "AutoDialer";       // Access point name
@@ -101,6 +111,7 @@ AsyncWebServer server(80);               // Webserver
 AsyncEventSource events("/events");      // SSE endpoint
 unsigned long previousSendTime = 0;      // Last time data was sent to the webserver
 String header;
+String startBody = "";
 
 TMC5160Stepper driver(CS_PIN, R_SENSE, MOSI_PIN, MISO_PIN, SCK_PIN);  // Create driver
 SafeLock* lock = new SafeLock;                                        // Create lock object
@@ -118,7 +129,7 @@ void setup() {
   WifiSetup(ssidap, passwordap);
 
   events.onConnect([](AsyncEventSourceClient* client) {
-    client->send("", NULL, millis(), 10000);
+      client->send("", NULL, 0, 10000);  // 0 instead of millis()
   });
   server.addHandler(&events);
 
@@ -156,6 +167,19 @@ void setup() {
   });
 
   // Stops everything
+  server.on("/pause", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send(200, "text/plain", "true");
+    pauseDialing = true;
+    SendStatusSimple("PAUSED");
+  });
+
+  // Stops everything
+  server.on("/resume", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send(200, "text/plain", "true");
+    pauseDialing = false;
+  });
+
+  // Stops everything
   server.on("/stop", HTTP_GET, [](AsyncWebServerRequest* request) {
     request->send(200, "text/plain", "true");
     emergencyStop = true;
@@ -173,6 +197,17 @@ void setup() {
     }
   });
 
+  // Resume on power loss
+  server.on("/powerLossResume", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (LittleFS.exists("/progress.json") && LittleFS.exists("/config.json") && !busy) {
+      request->send(200, "text/plain", "true");
+      powerLossResume = true;
+    }
+    else {
+      request->send(200, "text/plain", "false");
+    }
+  });
+
   // Starts auto dialing
   server.on("/start", HTTP_POST, [](AsyncWebServerRequest* request){}, NULL,
     [](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
@@ -181,9 +216,24 @@ void setup() {
         return;
       }
 
-      DynamicJsonDocument doc(4096);
-      DeserializationError error = deserializeJson(doc, data, len);
+      // Accumulate chunks
+      if (index == 0) {
+        startBody = "";  // Reset on first chunk
+      }
+      for (size_t i = 0; i < len; i++) {
+        startBody += (char)data[i];
+      }
+
+      // Only parse once all chunks have arrived
+      if (index + len < total) {
+        return;
+      }
+
+      DynamicJsonDocument doc(16384);
+      DeserializationError error = deserializeJson(doc, startBody);
       if (error) {
+        Serial.print("JSON error: ");
+        Serial.println(error.c_str());
         request->send(400, "text/plain", "Invalid JSON");
         return;
       }
@@ -197,6 +247,11 @@ void setup() {
       lock->rotConversion = doc["rotConversion"].as<float>();
       lock->openPast = doc["openDistance"].as<float>();
       lock->avoidRange = doc["avoidWithin"].as<float>();
+
+      if (lock->openRot == "Unknown") {
+        lock->openRot = "R";
+        checkBoth = true;
+      }
 
       // Add wheels
       JsonArray wheelsArray = doc["wheels"].as<JsonArray>();
@@ -219,18 +274,34 @@ void setup() {
         checkDropIn = true;
       }
 
-      // Get speed
-      speed = doc["speed"].as<int>();
+      // Free previous array if exists
+      if (possibleNums != nullptr) {
+        delete[] possibleNums;
+        possibleNums = nullptr;
+      }
+
+      // Parse possible known numbers
+      JsonArray numsArr = doc["possibleNums"].as<JsonArray>();
+      possibleNumsCount = numsArr.size();
+      if (possibleNumsCount > 0) {
+        possibleNums = new float[possibleNumsCount];
+        for (int i = 0; i < possibleNumsCount; i++) {
+          possibleNums[i] = numsArr[i].as<float>();
+        }
+      }
 
       // Get wheel 1 start position
       wheelOneStartPosition = doc["w1start"].as<float>();
 
+      // Get speed
+      speed = doc["speed"].as<int>();
+
       if (speed == 1) {
-        maxDelay = 1100;
+        maxDelay = 1800;
         minDelay = 300; 
       }
       else if (speed == 2) {
-        maxDelay = 900;
+        maxDelay = 1200;
         minDelay = 250; 
       }
       else if (speed == 3) {
@@ -279,6 +350,35 @@ void setup() {
 
 // Checks for what task to do next
 void loop() {
+  if (powerLossResume && !busy) {
+    busy = true;
+    emergencyStop = false;
+
+    LoadConfigs();
+    SendLog("Starting auto dialing");
+    LogWheels();
+    SendLog("Speed: " + String(speed));
+    SendLog("Lock open rotation: " + lock->openRot);
+    SendLog("Check drop-in: " + String(checkDropIn ? "True" : "False"));
+    SendLog("RCP: " + String(lock->RCP));
+    SendLog("LCP: " + String(lock->LCP));
+    SendLog("Check every 'x': " + String(lock->everyX));
+    SendLog("Avoid range: " + String(lock->avoidRange));
+    SendLog("Open past by: " + String(lock->openPast));
+    SendLog("Rotational conversion: " + String(lock->rotConversion));
+    SaveConfigs();
+
+    SendLog("Calibrating stall...");
+    CalibrateStall();
+
+    if (!emergencyStop) {
+      AutoDial();
+    }
+  
+    powerLossResume = false;
+    busy = false;
+  }
+
   if (start && !busy) {
     start = false;
     busy = true;
@@ -298,11 +398,25 @@ void loop() {
     SendLog("Avoid range: " + String(lock->avoidRange));
     SendLog("Open past by: " + String(lock->openPast));
     SendLog("Rotational conversion: " + String(lock->rotConversion));
+    SaveConfigs();
 
-    AutoDial();
+    if (possibleNumsCount > 0) {
+      for (int i = 0; i < triedComboCount; i++) {
+          free(triedCombos[i]); // free each inner array
+      }
+      free(triedCombos);        // free the outer array
+      triedCombos = nullptr;
+      triedComboCount = 0;
+      TryCombinations(possibleNums, possibleNumsCount);
+    }
+
+    if (!emergencyStop) {
+      AutoDial();
+    }
   
     busy = false;
   }
+
   if (center && !busy) {
     center = false;
     busy = true;
@@ -319,6 +433,7 @@ void loop() {
     lock->position = 0;
     busy = false;
   }
+
   if (spin && !busy) {
     spin = false;
     busy = true;
@@ -350,9 +465,185 @@ void WifiSetup(const char* name, const char* pass) {
   }
 }
 
+// Save variables for restore
+void SaveConfigs() {
+  DynamicJsonDocument doc(2048);
+
+  // SafeLock fields
+  doc["position"]      = lock->position;
+  doc["lastRotation"]  = lock->lastRotation;
+  doc["openRot"]       = lock->openRot;
+  doc["rcp"]           = lock->RCP;
+  doc["lcp"]           = lock->LCP;
+  doc["rotConversion"] = lock->rotConversion;
+  doc["everyX"]        = lock->everyX;
+  doc["openPast"]      = lock->openPast;
+  doc["avoidRange"]    = lock->avoidRange;
+
+  // Runtime vars (not in struct but needed to restore session)
+  doc["speed"]      = speed;
+  doc["checkDropIn"] = checkDropIn;
+  doc["checkBoth"]  = checkBoth;
+  doc["wheelOneStartPosition"] = wheelOneStartPosition;
+
+  // Wheels array — all Wheel fields
+  JsonArray wheels = doc.createNestedArray("wheels");
+  for (int x = 0; x < lock->wheelCount; x++) {
+    JsonObject w = wheels.createNestedObject();
+    w["position"] = lock->wheels[x].position;
+    w["rotation"] = lock->wheels[x].rotation;
+    w["openRot"]  = lock->wheels[x].openRot;
+    w["testNum"]  = lock->wheels[x].testNum;
+
+    JsonArray excl = w.createNestedArray("exclusions");
+    for (int y = 0; y < lock->wheels[x].exclusionCount; y++) {
+      excl.add(lock->wheels[x].exclusions[y]);
+    }
+  }
+
+  File f = LittleFS.open("/config.json", "w");
+  if (!f) {
+    SendLog("Failed to open config for writing");
+    return;
+  }
+  serializeJson(doc, f);
+  f.close();
+  SendLog("Config saved");
+}
+
+// Load variables for resuming previous session
+bool LoadConfigs() {
+  if (!LittleFS.exists("/config.json")) {
+    SendLog("No saved config found");
+    return false;
+  }
+
+  File f = LittleFS.open("/config.json", "r");
+  if (!f) {
+    SendLog("Failed to open config for reading");
+    return false;
+  }
+
+  DynamicJsonDocument doc(2048);
+  DeserializationError error = deserializeJson(doc, f);
+  f.close();
+
+  if (error) {
+    SendLog("Config parse failed: " + String(error.c_str()));
+    return false;
+  }
+
+  // SafeLock fields
+  lock->position      = doc["position"].as<float>();
+  lock->lastRotation  = doc["lastRotation"].as<String>();
+  lock->openRot       = doc["openRot"].as<String>();
+  lock->RCP           = doc["rcp"].as<float>();
+  lock->LCP           = doc["lcp"].as<float>();
+  lock->rotConversion = doc["rotConversion"].as<float>();
+  lock->everyX        = doc["everyX"].as<float>();
+  lock->openPast      = doc["openPast"].as<float>();
+  lock->avoidRange    = doc["avoidRange"].as<float>();
+
+  // Runtime vars
+  speed               = doc["speed"].as<int>();
+  checkDropIn         = doc["checkDropIn"].as<bool>();
+  checkBoth           = doc["checkBoth"].as<bool>();
+  wheelOneStartPosition = doc["wheelOneStartPosition"].as<float>();
+
+  // Restore speed delays
+  if (speed == 1)      { maxDelay = 1100; minDelay = 300; }
+  else if (speed == 2) { maxDelay = 900;  minDelay = 250; }
+  else if (speed == 3) { maxDelay = 700;  minDelay = 200; }
+
+  // Restore wheels — all Wheel fields
+  lock->clearWheels();
+  JsonArray wheels = doc["wheels"].as<JsonArray>();
+  for (JsonObject w : wheels) {
+    String rotation = w["rotation"].as<String>();
+    String openRot  = w["openRot"].as<String>();
+    float  position = w["position"].as<float>();
+    float  testNum  = w["testNum"].as<float>();
+
+    JsonArray excArr = w["exclusions"].as<JsonArray>();
+    int exclusionCount = excArr.size();
+    int* exclusions = new int[exclusionCount];
+    for (int i = 0; i < exclusionCount; i++) {
+      exclusions[i] = excArr[i].as<int>();
+    }
+
+    lock->addWheel(position, rotation, openRot, testNum, exclusions, exclusionCount);
+    delete[] exclusions;
+  }
+
+  // Recalculate derived value
+  float dropInWidth = GetDistance(lock->LCP, lock->RCP, "L") / stepsPerRevolution;
+  dropInPoint = NormalizeNum(lock->RCP - (dropInWidth / 2.0));
+
+  SendLog("Config loaded");
+  return true;
+}
+
+// Save current dialing progress for restore
+void SaveProgress(float* curCombo, int* numsTried, int current, int count) {
+  DynamicJsonDocument doc(1024);
+
+  doc["current"] = current;
+  doc["count"]   = count;
+
+  JsonArray combo = doc.createNestedArray("curCombo");
+  JsonArray tried = doc.createNestedArray("numsTried");
+  for (int x = 0; x < lock->wheelCount; x++) {
+    combo.add(curCombo[x]);
+    tried.add(numsTried[x]);
+  }
+
+  File f = LittleFS.open("/progress.json", "w");
+  if (!f) {
+    SendLog("Failed to save progress");
+    return;
+  }
+  serializeJson(doc, f);
+  f.close();
+}
+
+// Load dialing variables for resuming previous session
+bool LoadProgress(float* curCombo, int* numsTried, int& current, int& count) {
+  if (!LittleFS.exists("/progress.json")) {
+    return false;
+  }
+
+  File f = LittleFS.open("/progress.json", "r");
+  if (!f) {
+    SendLog("Failed to open progress file");
+    return false;
+  }
+
+  DynamicJsonDocument doc(1024);
+  DeserializationError error = deserializeJson(doc, f);
+  f.close();
+
+  if (error) {
+    SendLog("Progress parse failed: " + String(error.c_str()));
+    return false;
+  }
+
+  current = doc["current"].as<int>();
+  count   = doc["count"].as<int>();
+
+  JsonArray combo = doc["curCombo"].as<JsonArray>();
+  JsonArray tried = doc["numsTried"].as<JsonArray>();
+  for (int x = 0; x < lock->wheelCount; x++) {
+    curCombo[x]  = combo[x].as<float>();
+    numsTried[x] = tried[x].as<int>();
+  }
+
+  return true;
+}
+
 // Send message to webserver
 void SendLog(String message) {
-  events.send(message.c_str(), "log", millis());
+  if (events.count() > 0)
+    events.send(message.c_str(), "log", millis());
 }
 
 // Sends wheels config to web server
@@ -376,20 +667,39 @@ void LogWheels() {
 }
 
 // Send status update to web server
-void SendStatus(String status, float* wheelNums, int wheelCount, int current, int total) {
+void SendStatus(String status, float* wheelNums, int wheelCount, int current, int total, String phase = "brute") {
+  if (events.count() == 0) return;
+
   String json = "{\"status\":\"" + status + "\",\"wheels\":[";
   for (int i = 0; i < wheelCount; i++) {
     json += String(wheelNums[i], 1);
     if (i < wheelCount - 1) json += ",";
   }
-  json += "],\"current\":" + String(current) + ",\"total\":" + String(total) + "}";
+  json += "],\"current\":" + String(current) + ",\"total\":" + String(total) + ",\"phase\":\"" + phase + "\"";
+  json += ",\"everyX\":" + String(lock->everyX, 4);
+  json += ",\"rcp\":" + String(lock->RCP, 4);
+  json += ",\"lcp\":" + String(lock->LCP, 4);
+  json += ",\"checkDropIn\":" + String(checkDropIn ? "true" : "false");
+  json += ",\"wheelMeta\":[";
+  for (int i = 0; i < lock->wheelCount; i++) {
+    json += "{\"excl\":[";
+    for (int y = 0; y < lock->wheels[i].exclusionCount; y++) {
+      json += String(lock->wheels[i].exclusions[y]);
+      if (y < lock->wheels[i].exclusionCount - 1) json += ",";
+    }
+    json += "]}";
+    if (i < lock->wheelCount - 1) json += ",";
+  }
+  json += "]}";
   events.send(json.c_str(), "status", millis());
 }
 
 // Send status with no wheel numbers (waiting / emergency stop)
 void SendStatusSimple(String status) {
-  String json = "{\"status\":\"" + status + "\",\"wheels\":[],\"current\":0,\"total\":0}";
-  events.send(json.c_str(), "status", millis());
+  if (events.count() > 0) {
+    String json = "{\"status\":\"" + status + "\",\"wheels\":[],\"current\":0,\"total\":0}";
+    events.send(json.c_str(), "status", millis());
+  }
 }
 
 // Normalizes numbers to within the 0-100 dial range
@@ -443,11 +753,11 @@ void MoveMotor(String direction, int steps) {
     
     // Enable StallGuard after x steps and only if we're testing an open
     if (testingOpen && !stallGuardArmed && stepsPerRevolution / 50 >= 0 && currentStep >= stepsPerRevolution / 50) {
-        driver.GSTAT(0b111);
-        delayMicroseconds(100);
-        stallGuardArmed = true;
-        attachInterrupt(digitalPinToInterrupt(DIAG0_PIN), OnStall, RISING);
-        driver.TCOOLTHRS(0xFFFFF);
+      driver.GSTAT(0b111);
+      delayMicroseconds(100);
+      stallGuardArmed = true;
+      attachInterrupt(digitalPinToInterrupt(DIAG0_PIN), OnStall, RISING);
+      driver.TCOOLTHRS(0xFFFFF);
     }
 
     // Calculate current delay based on S-curve acceleration profile
@@ -674,7 +984,7 @@ void SetWheel(int wheel, float targetPos, String direction) {
     float distanceToCurrentWheel = GetDistance(tempPos, currentWheelPosition, direction);   // How far to current wheel
     float rotConversionInc = (float)(lock->wheelCount - x) * lock->rotConversion;           // Rotational conversion amount for current wheel in increments
     float rotConversion = rotConversionInc * (stepsPerRevolution / 100.0);                  // Rotational conversion amount for current wheel in steps
-    bool rotConvUsed = false;
+    bool rotConvUsed = false;                                                               // Whether rotational conversion needs to be taken into account
 
     // If wheels are in the same place
     if (distanceToCurrentWheel == 0) {
@@ -760,17 +1070,35 @@ void CalibrateStall() {
 
   SendStatusSimple("Calibrating");
 
+  // Clear any latched stall event from a previous run before we begin.
+  // DIAG0 can be left high after a power loss or emergency stop; if so,
+  // the interrupt would fire instantly when armed and cause a false stop.
+  detachInterrupt(digitalPinToInterrupt(DIAG0_PIN));
+  driver.TCOOLTHRS(0);
+  driver.GSTAT(0b111);
+  delay(50);
+  emergencyStop = false;
+
   // Pick up all wheels to calibrate stall value with the weight of all wheels
   Rotate(lock->openRot, lock->wheelCount);
+
+  // Clear any stale interrupt that may have fired during the rotate
+  driver.GSTAT(0b111);
+  delay(20);
+  emergencyStop = false;
   
   // Test different stall values
-  testingOpen = true;
   for (int x = 50; x >= -64; x -= 2) {
     SendLog("Testing: " + String(x));
     driver.sgt(x);
 
     // Move the same way to calibrate stall as when detecting an open
+    testingOpen = true;
     Move(lock->openRot, lock->openPast);
+
+    // Go back
+    testingOpen = false;
+    Move((lock->openRot == "L") ? "R" : "L", lock->openPast);
 
     // Set it to just above where it stalled
     if (emergencyStop) {
@@ -828,16 +1156,28 @@ bool ValidCombo(float* nums, int count) {
     }
   }
 
+  // Rule 4: Combination can't already be tried from given possible known numbers
+  for (int i = 0; i < triedComboCount; i++) {
+    bool match = true;
+    for (int j = 0; j < count; j++) {
+      if (fabs(triedCombos[i][j] - nums[j]) > 0.001f) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return false;
+  }
+
   return true;
 }
 
 // Checks if the lock is open after each combination
 void TestOpen() {
   // Go to drop-in area
-  if (lock->wheels[lock->wheelCount - 1].openRot == "L") {
+  if (lock->lastRotation == "L") {
     GoTo("R", dropInPoint);
   }
-  else {
+  else if (lock->lastRotation == "R") {
     GoTo("L", dropInPoint);
   }
 
@@ -883,6 +1223,100 @@ void TestOpen() {
   }
 }
 
+// Count total permutations from given possible known numbers
+long long TotalPermutations(int n, int r) {
+  long long result = 1;
+  for (int i = 0; i < r; i++) {
+    result *= (n - i);
+  }
+  return result;
+}
+
+// Permutates through user given possible numbers
+void SinglePermutations(float* nums, int count, float* current, bool* used, int depth, long long& currentTry, long long totalTries) {
+  if (emergencyStop) {
+    return;
+  }
+
+  // Stop at lock->wheelCount length of combination
+  if (depth == lock->wheelCount) {
+    currentTry++;
+
+    // Grow array by 1
+    triedCombos = (float**)realloc(triedCombos, (triedComboCount + 1) * sizeof(float*));
+    
+    // Allocate the inner array and copy the combo in
+    triedCombos[triedComboCount] = (float*)malloc(lock->wheelCount * sizeof(float));
+    for (int x = 0; x < lock->wheelCount; x++) {
+      triedCombos[triedComboCount][x] = current[x];
+    }
+    triedComboCount++;
+
+    // Build combo string for status
+    String comboStr = "";
+    for (int x = 0; x < lock->wheelCount; x++) {
+      comboStr += String(current[x], 1);
+      if (x < lock->wheelCount - 1) comboStr += " - ";
+    }
+    SendStatus("Trying " + comboStr, current, lock->wheelCount, currentTry, totalTries, "perm");
+
+    // Set each wheel to its position with its opening rotation
+    for (int x = 0; x < lock->wheelCount; x++) {
+      SetWheel(x + 1, current[x], lock->wheels[x].openRot);
+    }
+    TestOpen();
+
+    // If opening rotation is unknown
+    if (checkBoth) {
+      SendLog("Checking both");
+
+      // Dial combination again in case any wheels were messed up
+      for (int x = 0; x < lock->wheelCount; x++) {
+        SetWheel(x + 1, current[x], lock->wheels[x].openRot);
+      }
+
+      lock->openRot = (lock->openRot == "L") ? "R" : "L";   // Change opening direction
+      TestOpen();
+      lock->openRot = (lock->openRot == "L") ? "R" : "L";   // Change opening direction back to original
+    }
+
+    return;
+  }
+
+  // Build current combination
+  for (int i = 0; i < count; i++) {
+    
+    // If number has not been used yet
+    if (!used[i]) {
+      used[i] = true;                                                                     // Mark it used
+      current[depth] = nums[i];                                                           // Add it to combo
+      SinglePermutations(nums, count, current, used, depth + 1, currentTry, totalTries);  // Test combo
+      used[i] = false;                                                                    // Mark as unused for future permutations
+    }
+  }
+}
+
+// Try user given possible combinations before auto dialing
+void TryCombinations(float* nums, int count) {
+  if (count < lock->wheelCount) {
+    return;
+  }
+  float* current = new float[lock->wheelCount];
+  bool* used = new bool[count];
+
+  // Mark each number as unused first
+  for (int i = 0; i < count; i++) {
+    used[i] = false;
+  }
+
+  long long currentTry = 0;
+  long long totalTries = TotalPermutations(count, lock->wheelCount);
+  SinglePermutations(nums, count, current, used, 0, currentTry, totalTries);
+  
+  delete[] current;
+  delete[] used;
+}
+
 // Starts auto dialing
 void AutoDial() {
   float startNum = 0;                       // Starting number for incrementing combination
@@ -895,8 +1329,6 @@ void AutoDial() {
     curCombo[x] = startNum;
     numsTried[x] = 0;
   }
-
-  curCombo[0] = wheelOneStartPosition;      // Start wheel one to value from webpage
 
   // Count total amount of possibilities
   int count = 0;
@@ -953,8 +1385,16 @@ void AutoDial() {
     numsTried[x] = 0;
   }
 
-  // Make sure all wheels are on 0
-  Rotate(lock->wheels[0].openRot, lock->wheelCount);
+  // Check for resuming previous session
+  if (powerLossResume && LoadProgress(curCombo, numsTried, current, count)) {
+    SendLog("Resuming from combination " + String(current));
+    powerLossResume = false;
+  } 
+  else {
+    // Fresh start
+    Rotate(lock->wheels[0].openRot, lock->wheelCount);
+    curCombo[0] = wheelOneStartPosition;
+  }
 
   // Dew it
   while (!done) {
@@ -989,6 +1429,36 @@ void AutoDial() {
         SetWheel(x + 1, curCombo[x], lock->wheels[x].openRot);
       }
       TestOpen();   // Test if lock is open
+
+      // Save current progress every 100th attempt to descrease wear on flash and avoid increase in run time
+      if (current % 100 == 0) {
+        SaveProgress(curCombo, numsTried, current, count);
+      }
+
+      if (pauseDialing) {
+        driver.rms_current(1000);
+
+        while (pauseDialing) {
+          delay(100);
+        }
+
+        driver.rms_current(2200);
+        delay(250);
+      }
+
+      // If opening rotation is unknown
+      if (checkBoth) {
+        SendLog("Checking both");
+
+        // Dial combination again in case any wheels were messed up
+        for (int x = 0; x < lock->wheelCount; x++) {
+          SetWheel(x + 1, curCombo[x], lock->wheels[x].openRot);
+        }
+
+        lock->openRot = (lock->openRot == "L") ? "R" : "L";   // Change opening direction
+        TestOpen();
+        lock->openRot = (lock->openRot == "L") ? "R" : "L";   // Change opening direction back to original
+      }
     }
 
     // Increment combination
@@ -1034,5 +1504,7 @@ void AutoDial() {
     }
   }
 
+  LittleFS.remove("/progress.json");
+  LittleFS.remove("/config.json");
   SendLog("Auto dialing finished");
 }

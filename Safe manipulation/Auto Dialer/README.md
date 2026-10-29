@@ -2,18 +2,51 @@
 
 Video: https://youtu.be/TwCeOCCC2Mc
 
-An auto dialer is a device which automatically tries possible combinations for most group 2 and group 1 mechanical safe locks and stops when it detects the lock is open. Commercial auto dialers start at $2,000+ and are usually restrcited to locksmith or government purchases only. I strongly disagree with this mindset so here's one that beats all the others on the market and is only ~$100-$200 depending on where you live. I am far from the most capable so the source code is available for anyone to improve upon. 
+An auto dialer is a device which automatically tries possible combinations for most group 2 and group 1 mechanical safe locks and stops when it detects the lock is open. Commercial auto dialers start at $2,000+ and are usually restrcited to locksmith or government purchases only. I strongly disagree with this mindset so here's one that beats all the others on the market and is only ~$150-$200 depending on where you live and what you might already have. I am far from the most capable so the source code is available for anyone to improve upon. 
 
 ![Full](Images/Full.jpg)
 ![Gripper](Images/Gripper.jpg)
 
-Controls at:
+## Features
+
+The most efficient as possible dialing algorithm
+
+Any number of wheels and custom dialing direction per wheel
+
+Per wheel exclusion zones for numbers to not try
+
+Can provide possible numbers in the combination
+
+3 different speeds
+
+Highly customizable settings
+
+Highly compatible mounting with most safes
+
+Easy to setup
+
+Control from web interface with any phone/tablet/computer, no app or software needed
+
+Tuned acceleration/deceleration curve for minimal to no wear on the lock
+
+Source code and parts list publicly available for anyone to modify
+
+Live view of wheel positions and progress
+
+Can pause and resume
+
+
+## Controls
 
 Wifi Name: AutoDialer
 
 Wifi Password: AutoDialer
 
 Home Page: 192.168.0.1
+
+Home Page Username: root
+
+Home Page Password: toor
 
 Disclaimer
 ----------
@@ -72,6 +105,8 @@ I have uploaded .step files for easier editing if anyone needs to change dimensi
 
 ## Wiring
 
+![Schematic](Images/dialer-schematic.png)
+
 TMC5160
 
 EN - Any GND
@@ -106,6 +141,10 @@ VIO - ESP 3v
 
 GND - ESP GND
 
+DIAG0 - ESP GPIO 8
+
+DIAG1 - ESP GPIO 7
+
 ESP
 
 5v - Power supply 5v
@@ -121,6 +160,10 @@ GPIO 4 - TMC5160 SCK
 GPIO 5 - TMC5160 CS
 
 GPIO 6 - TMC5160 MISO
+
+GPIO 7 - TMC5160 DIAG1
+
+GPIO 8 - TMC5160 DIAG0
 
 GPIO 9 - TMC5160 DIR
 
@@ -202,8 +245,8 @@ To do
 -----
 (I may not get around to any of this)
 1. Improve calibration (or just read raw sg value) to add support for more speeds.
-2. Add "Unknown" as an option for lock opening rotation and try both directions.
-3. Sort all valid combinations more intelligently e.g. try all valid dates first.
+2. Sort all valid combinations more intelligently e.g. try all valid dates first.
+3. ~~If possible known numbers in the combination are entered, skip over them while auto dialing to avoid duplicates.~~ Currently in progress.
 
 ## License
 This project is licensed under the PolyForm Noncommercial License 1.0.0. 
